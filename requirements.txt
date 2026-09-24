@@ -1,0 +1,12 @@
+# Runtime + test dependencies for the DIGIT toolkit.
+# The toolkit imports only these; it does NOT import digit-interface (see
+# CREDITS.md).  Capture/LED conventions follow that project, but capture is
+# re-implemented here so the metadata node and the QVGA/60fps default cannot
+# wedge the sensor.  digit-interface is CC-BY-NC-4.0, so keep it optional.
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.10
+scikit-learn>=1.3
+linuxpy>=0.25
+pyudev>=0.24
+pytest>=7.0

@@ -1,0 +1,14 @@
+# generated data / caches
+.logs/
+sessions/
+snapshots/
+datasets/
+models/
+/reference.png
+/reference.npy
+*.npy
+*.avi
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/

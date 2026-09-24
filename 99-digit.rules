@@ -1,0 +1,15 @@
+# DIGIT optical tactile sensor (Facebook/Meta, USB 2833:0209)
+#
+# 1) Disable USB autosuspend: the DIGIT firmware can wedge after a
+#    suspend/resume cycle (0-byte frames, EPROTO -71) and then needs a replug.
+# 2) Make the usbfs node group-writable so `make reset` (a soft USB reset, the
+#    software equivalent of a replug) works without sudo.
+# 3) Keep the video nodes group-readable by `video`.
+#
+# One-line install (needs sudo, once):
+#   sudo cp 99-digit.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+# then unplug and replug the sensor.
+
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2833", ATTR{idProduct}=="0209", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2833", ATTR{idProduct}=="0209", MODE="0664", GROUP="plugdev"
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="2833", ATTRS{idProduct}=="0209", MODE="0660", GROUP="video"
