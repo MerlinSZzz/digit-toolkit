@@ -48,6 +48,32 @@ def load_reference(path: str) -> np.ndarray:
     return img
 
 
+def _live_set_mode(
+    camera: DigitCamera,
+    thread: CaptureThread,
+    width: int,
+    height: int,
+    fps: int,
+    recapture_reference: bool = False,
+    verbose: bool = True,
+):
+    """Change the mode mid-view safely.
+
+    The reader thread is stopped first, then :meth:`DigitCamera.set_mode` closes
+    and reopens the device with the new width/height/fps applied before the
+    first read.  Mode properties are **never** set on the live handle.  Returns
+    ``(new_thread, reference_or_None)``.
+    """
+    thread.stop()
+    thread.join(timeout=1.0)
+    camera.set_mode(width, height, fps)
+    reference = capture_reference(camera, verbose=verbose) if recapture_reference else None
+    new_thread = CaptureThread(camera)
+    new_thread.start()
+    new_thread.wait_new(-1, timeout=3.0)
+    return new_thread, reference
+
+
 def run_view(
     camera: DigitCamera,
     mode: str = "dashboard",
@@ -189,6 +215,31 @@ def run_view(
                     reference = capture_reference(camera, verbose=verbose)
                     processor.set_reference(reference)
                     prev_gray = None
+                if key in (ord("["), ord("]")):
+                    # fps change mid-view: stop the reader, then close-and-reopen
+                    step = -5 if key == ord("[") else 5
+                    new_fps = max(5, min(60, int(camera.fps) + step))
+                    if new_fps != camera.fps:
+                        thread, _ = _live_set_mode(camera, thread, camera.width, camera.height, new_fps)
+                        if verbose:
+                            print(f"[viewer] mode -> {camera.mode_line()} (reopened)", flush=True)
+                if key == ord("v"):
+                    # resolution toggle; the frame size changes so re-capture
+                    width, height = (
+                        (320, 240) if (camera.width, camera.height) != (320, 240) else (640, 480)
+                    )
+                    thread, new_reference = _live_set_mode(
+                        camera, thread, width, height, camera.fps, recapture_reference=True
+                    )
+                    if new_reference is not None:
+                        reference = new_reference
+                        processor.set_reference(reference)
+                        prev_gray = None
+                    if verbose:
+                        print(
+                            f"[viewer] mode -> {camera.mode_line()} (reopened, reference re-captured)",
+                            flush=True,
+                        )
                 if key == ord("p") and pause_key:
                     paused = True
                     print("paused - press any key to resume", flush=True)

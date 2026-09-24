@@ -30,6 +30,22 @@ from .device import DigitInfo, find_digit
 LED_MIN = 0
 LED_MAX = 15
 
+#: Mode properties that must never be touched on a capture that is streaming.
+#: (The UVC "Zoom" LED control is deliberately *not* in this set.)
+MODE_PROPERTIES = frozenset(
+    (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT, cv2.CAP_PROP_FPS, cv2.CAP_PROP_BUFFERSIZE)
+)
+
+#: A rolled (mis-aligned) YUYV buffer wraps once, leaving a single sharp vertical
+#: seam.  On this unit the ratio of the seam peak to the median column-to-column
+#: discontinuity is ~14 for a rolled frame and < 5 for a clean one.  A real
+#: content edge can also be sharp, so we additionally require the seam to be
+#: *isolated* (much stronger than the next-strongest edge) unless the
+#: discontinuity is very strong.
+ROLL_MIN_CONFIDENCE = 6.0
+ROLL_MIN_ISOLATION = 4.0
+ROLL_STRONG_CONFIDENCE = 10.0
+
 
 class CameraError(RuntimeError):
     """Raised when the sensor cannot be opened or a frame cannot be read."""
@@ -40,6 +56,67 @@ def _pack_rgb(r: int, g: int, b: int) -> int:
         if not 0 <= int(value) <= LED_MAX:
             raise ValueError(f"LED values must be 0..{LED_MAX}, got {value}")
     return (int(r) << 8) | (int(g) << 4) | int(b)
+
+
+def detect_roll(
+    frame: np.ndarray,
+    min_confidence: float = ROLL_MIN_CONFIDENCE,
+    min_isolation: float = ROLL_MIN_ISOLATION,
+    strong_confidence: float = ROLL_STRONG_CONFIDENCE,
+):
+    """Detect a circular horizontal roll (a wrapped YUYV buffer).
+
+    A buffer misalignment shifts the whole image sideways and wraps the part
+    that falls off one edge back onto the other, creating one sharp vertical
+    seam.  We find the column boundary with the largest mean absolute
+    difference; if it stands far above the typical boundary (a *wrap* seam, not
+    the gel's own soft edges) we return the number of columns to roll the image
+    to the right to undo it.
+
+    Two guards keep natural content edges (e.g. the gel/housing border) from
+    being mistaken for a wrap: the peak must be ``>= min_confidence`` times the
+    median boundary, and either well isolated from the next-strongest edge
+    (``>= min_isolation``) or very strong (``>= strong_confidence``).
+
+    Returns ``(shift, confidence)``.  ``shift == 0`` means "no roll detected",
+    either because the frame is clean or because the discontinuity is not sharp
+    enough to trust.  A *physical* sideways move of the sensor does not wrap, so
+    it does not produce this seam and is deliberately left alone.
+    """
+    gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if gray.shape[1] < 16:
+        return 0, 0.0
+    profile = np.abs(np.diff(gray.astype(np.float32), axis=1)).mean(axis=0)
+    k = int(np.argmax(profile))
+    peak = float(profile[k])
+    median = float(np.median(profile))
+    confidence = peak / (median + 1e-6)
+    if confidence < float(min_confidence):
+        return 0, confidence
+    isolated = np.ones(profile.shape, dtype=bool)
+    lo, hi = max(0, k - 6), min(profile.size, k + 7)
+    isolated[lo:hi] = False
+    second = float(profile[isolated].max()) if isolated.any() else 0.0
+    isolation = peak / (second + 1e-6)
+    if isolation < float(min_isolation) and confidence < float(strong_confidence):
+        return 0, confidence
+    width = int(gray.shape[1])
+    shift = (width - 1 - k) % width
+    if shift > width // 2:
+        shift -= width  # report the smaller-magnitude equivalent, e.g. -120 not 360
+    return int(shift), confidence
+
+
+def fix_roll(
+    frame: np.ndarray,
+    min_confidence: float = ROLL_MIN_CONFIDENCE,
+    min_isolation: float = ROLL_MIN_ISOLATION,
+    strong_confidence: float = ROLL_STRONG_CONFIDENCE,
+):
+    """Undo a detected roll; return ``(fixed_frame, shift, confidence)``."""
+    shift, confidence = detect_roll(frame, min_confidence, min_isolation, strong_confidence)
+    fixed = np.roll(frame, shift, axis=1) if shift else frame
+    return fixed, shift, confidence
 
 
 class DigitCamera:
@@ -63,6 +140,9 @@ class DigitCamera:
         led: Optional[int] = LED_MAX,
         warmup: int = 8,
         buffersize: int = 1,
+        roll_fix: bool = True,
+        roll_min_confidence: float = ROLL_MIN_CONFIDENCE,
+        roll_reopen_after: int = 8,
     ) -> None:
         self.serial = serial
         self.node = node
@@ -73,16 +153,28 @@ class DigitCamera:
         self.led = led
         self.warmup = int(warmup)
         self.buffersize = int(buffersize)
+        self.roll_fix = bool(roll_fix)
+        self.roll_min_confidence = float(roll_min_confidence)
+        self.roll_reopen_after = int(roll_reopen_after)
 
         self.info: Optional[DigitInfo] = None
         self.dev_name: str = node or ""
         self.revision: str = ""
         self._cap: Optional[cv2.VideoCapture] = None
+        self._stream_open = False
         self._frames = 0
         self._t_first = 0.0
         self._t_last = 0.0
         self._last_shape: Tuple[int, ...] = ()
         self._modes: Optional[list] = None
+        # roll diagnostics
+        self._roll_frames = 0
+        self._roll_corrected = 0
+        self._last_roll = 0
+        self._roll_bad = 0
+        self.roll_ok = True
+        self.last_roll_shift = 0
+        self.last_roll_confidence = 0.0
 
     # ------------------------------------------------------------------ open
     def open(self) -> "DigitCamera":
@@ -101,6 +193,22 @@ class DigitCamera:
         if self.info is not None:
             self.revision = self.info.revision
 
+        try:
+            self._open_at(self.width, self.height, self.fps)
+        except CameraError:
+            if (self.width, self.height) != (640, 480):
+                # fall back to the safest full-resolution mode
+                self.close()
+                self._open_at(640, 480, 30)
+            else:
+                self.close()
+                raise
+        self._t_first = self._t_last = time.time()
+        return self
+
+    def _open_at(self, width: int, height: int, fps: int) -> "DigitCamera":
+        """Open a fresh handle and apply ``width x height @ fps`` **before** the
+        first read (the only safe time to set the UVC mode properties)."""
         cap = cv2.VideoCapture(self.dev_name, cv2.CAP_V4L2)
         if not cap.isOpened():
             cap.release()
@@ -109,8 +217,9 @@ class DigitCamera:
                 f"sensor? Do you have video-group permission (`id`)?"
             )
         self._cap = cap
+        self._stream_open = False
         try:
-            self._configure(self.width, self.height, self.fps)
+            self._configure(width, height, fps)
             if self.led is not None:
                 self.set_led(self.led)
             for _ in range(max(0, self.warmup)):
@@ -118,7 +227,6 @@ class DigitCamera:
         except Exception:
             self.close()
             raise
-        self._t_first = self._t_last = time.time()
         return self
 
     # ------------------------------------------------------------------ read
@@ -133,12 +241,46 @@ class DigitCamera:
             )
         return frame
 
-    def read(self) -> np.ndarray:
-        """Return one BGR frame in the official orientation."""
+    def _grab(self) -> np.ndarray:
         frame = self._read_raw()
         self._last_shape = frame.shape
         if self.orientation:
             frame = cv2.flip(cv2.transpose(frame), 0)
+        return frame
+
+    def read(self) -> np.ndarray:
+        """Return one BGR frame in the official orientation.
+
+        With ``roll_fix=True`` (default) each frame is checked for the wrapped
+        YUYV buffer misalignment that shifts the image sideways, and the wrap is
+        undone.  If a roll does not clear after re-sync for several frames the
+        device is reopened (``reopen``), like a soft replug.
+        """
+        frame = self._grab()
+        if self.roll_fix:
+            frame, shift, confidence = fix_roll(frame, self.roll_min_confidence)
+            self._roll_frames += 1
+            self.last_roll_shift = int(shift)
+            self.last_roll_confidence = float(confidence)
+            if shift:
+                self._roll_corrected += 1
+                # the wrap must be gone after un-rolling; if a strong seam
+                # remains the misalignment is not a global roll.
+                _, after = detect_roll(frame, self.roll_min_confidence)
+                self.roll_ok = after < self.roll_min_confidence
+            else:
+                self.roll_ok = True
+            if self.roll_ok:
+                self._roll_bad = 0
+            else:
+                self._roll_bad += 1
+                if self.roll_reopen_after and self._roll_bad >= self.roll_reopen_after:
+                    self._roll_bad = 0
+                    self.reopen()
+                    frame = self._grab()
+                    frame, shift, confidence = fix_roll(frame, self.roll_min_confidence)
+                    self.last_roll_shift = int(shift)
+                    self.last_roll_confidence = float(confidence)
         self._frames += 1
         self._t_last = time.time()
         return frame
@@ -149,7 +291,11 @@ class DigitCamera:
         return self.set_led_rgb(level, level, level)
 
     def set_led_rgb(self, r: int, g: int, b: int) -> int:
-        """Set the red/green/blue LED channels independently (0..15 each)."""
+        """Set the red/green/blue LED channels independently (0..15 each).
+
+        The LED uses the UVC "Zoom" control, which *is* safe to change on a
+        live stream; the mode properties are the ones that are not.
+        """
         if self._cap is None:
             raise CameraError("camera is not open")
         packed = _pack_rgb(r, g, b)
@@ -169,7 +315,8 @@ class DigitCamera:
 
         The DIGIT/UVC combo does **not** like being reconfigured while it is
         already streaming (a mid-stream fps change wedged this unit once), so
-        this closes and reopens the camera instead of poking the live handle.
+        this closes the device and opens it again with the new width, height and
+        fps set before the first read -- it never pokes the live handle.
         """
         width, height, fps = int(width), int(height), int(fps)
         if (width, height, fps) != (self.width, self.height, self.fps):
@@ -180,9 +327,18 @@ class DigitCamera:
         return self.width, self.height, self.fps
 
     def _configure(self, width: int, height: int, fps: int) -> Tuple[int, int, int]:
-        """Apply a mode to a freshly opened handle (never mid-stream)."""
+        """Apply a mode to a freshly opened handle (never mid-stream).
+
+        Raises :class:`CameraError` if the handle is already streaming; mode
+        properties must only be set between ``open`` and the first read.
+        """
         if self._cap is None:
             raise CameraError("camera is not open")
+        if self._stream_open:
+            raise CameraError(
+                "refusing to set mode properties on a live stream; "
+                "use set_mode() which closes and reopens the device"
+            )
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
         self._cap.set(cv2.CAP_PROP_FPS, int(fps))
@@ -190,18 +346,9 @@ class DigitCamera:
         read_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         read_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         read_fps = int(round(self._cap.get(cv2.CAP_PROP_FPS)))
-        try:
-            self._read_raw()
-        except CameraError:
-            if (width, height) != (640, 480):
-                # fall back to the safest full-resolution mode
-                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                self._cap.set(cv2.CAP_PROP_FPS, 30)
-                self._read_raw()
-                read_w, read_h, read_fps = 640, 480, 30
-            else:
-                raise
+        # the first read starts the stream; from then on the mode is frozen
+        self._read_raw()
+        self._stream_open = True
         self.width, self.height, self.fps = read_w, read_h, read_fps
         return read_w, read_h, read_fps
 
@@ -209,7 +356,7 @@ class DigitCamera:
         return self.set_mode(self.width, self.height, fps)[2]
 
     def reopen(self) -> "DigitCamera":
-        """Close and reopen the camera (use after a USB glitch)."""
+        """Close and reopen the camera (use after a USB glitch or a bad roll)."""
         self.close()
         time.sleep(0.5)
         return self.open()
@@ -236,6 +383,10 @@ class DigitCamera:
             "frames": self._frames,
             "elapsed_s": elapsed,
             "mean_fps": self._frames / elapsed if self._frames else 0.0,
+            "roll_frames": self._roll_frames,
+            "roll_corrected": self._roll_corrected,
+            "last_roll_shift": self.last_roll_shift,
+            "last_roll_confidence": self.last_roll_confidence,
         }
 
     def mode_line(self) -> str:
@@ -251,6 +402,7 @@ class DigitCamera:
                 self._cap.release()
             finally:
                 self._cap = None
+        self._stream_open = False
 
     def __enter__(self) -> "DigitCamera":
         return self.open()

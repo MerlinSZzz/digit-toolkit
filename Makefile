@@ -26,6 +26,7 @@ FRAMES ?= 90
 MODE ?= dashboard
 THRESHOLD ?= 10
 MIN_AREA ?= 40
+MIN_PEAK ?= 25
 NAME ?=
 SESSION ?=
 OUT ?= .logs/view_$(MODE).png
@@ -52,7 +53,7 @@ REF_ARG := $(if $(REFERENCE),--reference $(REFERENCE),)
 .PHONY: help setup check info list devices modes snapshot reference led led-rgb fps \
         resolution view view-diff view-contact view-depth view-normal dashboard \
         save record sessions play monitor monitor-json eval synth train predict \
-        collect benchmark reset install-udev udev-check test selftest demo
+        collect press-test eval-session benchmark reset install-udev udev-check test selftest demo
 
 help:
 	@echo "DIGIT tactile sensor toolkit -- make targets"
@@ -83,6 +84,8 @@ help:
 	@echo "  train            train/evaluate a classifier on a dataset"
 	@echo "  predict          live prediction with a trained model"
 	@echo "  collect          interactively collect real labelled samples"
+	@echo "  press-test       guided real-press protocol -> labelled session folder"
+	@echo "  eval-session     real TPR/localisation/slip from a press-test session"
 	@echo ""
 	@echo "  benchmark        measure fps at every supported mode"
 	@echo "  test             run the sensor-free unit tests (pytest)"
@@ -170,11 +173,11 @@ play:
 
 monitor:
 	$(PY) -m digit monitor $(SERIAL_ARG) $(NODE_ARG) $(LED_ARG) --resolution "$(RES)" --fps $(FPS) \
-		--seconds $(SECONDS) --threshold $(THRESHOLD) --min-area $(MIN_AREA) $(FAKE_ARG) $(FAKE_REF_ARG)
+		--seconds $(SECONDS) --threshold $(THRESHOLD) --min-area $(MIN_AREA) --min-peak $(MIN_PEAK) $(FAKE_ARG) $(FAKE_REF_ARG)
 
 monitor-json:
 	$(PY) -m digit monitor $(SERIAL_ARG) $(NODE_ARG) $(LED_ARG) --resolution "$(RES)" --fps $(FPS) \
-		--seconds $(SECONDS) --threshold $(THRESHOLD) --min-area $(MIN_AREA) --json $(FAKE_ARG) $(FAKE_REF_ARG)
+		--seconds $(SECONDS) --threshold $(THRESHOLD) --min-area $(MIN_AREA) --min-peak $(MIN_PEAK) --json $(FAKE_ARG) $(FAKE_REF_ARG)
 
 eval:
 	$(PY) -m digit eval $(SERIAL_ARG) $(NODE_ARG) --threshold $(THRESHOLD) --min-area $(MIN_AREA) \
@@ -191,6 +194,19 @@ predict:
 
 collect:
 	$(PY) -m digit collect $(SERIAL_ARG) $(NODE_ARG) $(LABELS) --dataset $(DATASET) --frames $(FRAMES)
+
+# guided real-press protocol -> labelled session (untouched, 6 finger presses,
+# slide, small object).  Reads back with `make eval-session`.
+press-test:
+	$(PY) -m digit press-test $(SERIAL_ARG) $(NODE_ARG) $(LED_ARG) --resolution "$(RES)" --fps $(FPS) \
+		--root $(ROOT) $(if $(NAME),--out $(ROOT)/$(NAME),) $(FAKE_ARG) $(FAKE_REF_ARG)
+
+# real TPR / localisation / slip from a session written by `make press-test`.
+# MIN_PEAK=25 rejects the broad low-contrast chroma/strain disturbance measured
+# on the untouched 2026-09-24 recording (FPR 53% -> 11%).
+eval-session:
+	$(PY) -m digit eval-session "$(SESSION_ARG)" --root $(ROOT) $(REF_ARG) \
+		--threshold $(THRESHOLD) --min-area $(MIN_AREA) --min-peak $(MIN_PEAK)
 
 reset:
 	$(PY) -m digit reset $(SERIAL_ARG)

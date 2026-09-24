@@ -7,6 +7,7 @@ commands, so the same features are available interactively.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import time
@@ -472,7 +473,7 @@ def cmd_monitor(args) -> int:
     try:
         if reference is None:
             reference = capture_reference(camera, n=args.ref_frames)
-        detector = R.TouchDetector(reference, threshold=args.threshold, min_area=args.min_area)
+        detector = R.TouchDetector(reference, threshold=args.threshold, min_area=args.min_area, min_peak=args.min_peak)
         slip_detector = flow_mod.SlipDetector()
         thread = CaptureThread(camera)
         thread.start()
@@ -648,6 +649,264 @@ def cmd_collect(args) -> int:
         camera.close()
     dataset.save(dataset_path)
     _log(f"dataset saved: {dataset_path}  summary={dataset.summary()}")
+    return 0
+
+
+#: intended press locations for the guided real-press protocol (normalised
+#: centres inside the gel; drives localisation ground truth).
+PRESS_CELLS: List[Tuple[str, Tuple[float, float]]] = [
+    ("top-left", (0.25, 0.25)),
+    ("top-center", (0.50, 0.25)),
+    ("top-right", (0.75, 0.25)),
+    ("middle-left", (0.25, 0.50)),
+    ("middle-right", (0.75, 0.50)),
+    ("bottom-center", (0.50, 0.75)),
+]
+
+
+def cmd_press_test(args) -> int:
+    """Guided protocol: untouched -> one finger at 6 places -> slide -> object.
+
+    Every frame is written to a normal session folder, plus ``labels.csv``
+    (index, phase, label, cell) and ``protocol.json``.  ``eval-session`` reads
+    that folder directly, so tomorrow's real TPR / localisation / slip numbers
+    come from one recording and one command.
+    """
+    camera = _camera_from_args(args)
+    reference = load_reference(args.reference) if args.reference else None
+    outdir = args.out or os.path.join(args.root, "press_" + time.strftime("%Y%m%d_%H%M%S"))
+    writer = None
+    labels_fh = None
+    protocol: List[Dict[str, object]] = []
+    try:
+        if reference is None:
+            reference = capture_reference(camera, n=args.ref_frames)
+        writer = rec.SessionWriter(
+            outdir,
+            serial=camera.serial or "",
+            node=camera.dev_name,
+            width=camera.width,
+            height=camera.height,
+            fps=camera.fps,
+            led=camera.led,
+            save_video=not args.no_video,
+            reference=reference,
+        )
+        labels_fh = open(os.path.join(outdir, "labels.csv"), "w", newline="", encoding="utf-8")
+        labels_w = csv.writer(labels_fh)
+        labels_w.writerow(["index", "phase", "label", "cell"])
+
+        state = {"index": 0}
+
+        def record_phase(phase, label, seconds, cell="", instruction=""):
+            _log(f"\n[{phase}] {instruction}")
+            _log(f"    recording {seconds:g} s ...")
+            if not args.yes:
+                input("    press Enter to start > ")
+            start = state["index"]
+            t0 = time.time()
+            while time.time() - t0 < float(seconds):
+                frame = camera.read()
+                writer.add(frame)
+                labels_w.writerow([state["index"], phase, label, cell])
+                state["index"] += 1
+            protocol.append(
+                {
+                    "phase": phase,
+                    "label": label,
+                    "cell": cell,
+                    "start_index": start,
+                    "end_index": state["index"] - 1,
+                    "frames": state["index"] - start,
+                    "seconds": round(time.time() - t0, 2),
+                }
+            )
+            _log(f"    recorded {state['index'] - start} frames (index {start}..{state['index'] - 1})")
+
+        record_phase("untouched", "none", args.untouched_seconds, instruction="leave the gel untouched")
+        for name, _ in PRESS_CELLS:
+            record_phase(
+                f"press-{name}",
+                "press",
+                args.press_seconds,
+                cell=name,
+                instruction=f"press ONE finger firmly at {name} and hold still",
+            )
+        record_phase(
+            "slide",
+            "slide",
+            args.slide_seconds,
+            instruction="press and hold, then slide the finger slowly back and forth a few times",
+        )
+        for rep in range(1, int(args.object_reps) + 1):
+            record_phase(
+                f"object-{rep}",
+                "object",
+                args.object_seconds,
+                cell="object",
+                instruction=f"press a small hard object, rep {rep}/{int(args.object_reps)}",
+            )
+        meta = writer.close()
+        writer = None
+    finally:
+        if labels_fh is not None:
+            labels_fh.close()
+        if writer is not None:
+            writer.close()
+        camera.close()
+
+    payload = {
+        "session": os.path.abspath(outdir),
+        "reference": "reference.png",
+        "protocol": protocol,
+        "cells": {name: list(center) for name, center in PRESS_CELLS},
+        "n_frames": meta.n_frames,
+    }
+    with open(os.path.join(outdir, "protocol.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+    _log(f"\npress-test done: {meta.n_frames} frames -> {outdir}")
+    _log(f"labels: {os.path.join(outdir, 'labels.csv')}")
+    _log(f"now run: make eval-session SESSION={outdir}")
+    return 0
+
+
+def cmd_eval_session(args) -> int:
+    """Evaluate a labelled real session: TPR/FPR, localisation, slip."""
+    session = args.session
+    if not os.path.isdir(session):
+        sessions = rec.list_sessions(args.root, limit=1)
+        if not sessions:
+            _log(f"session not found: {session}")
+            return 1
+        session = sessions[0].path
+    try:
+        meta = rec.session_meta(session)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"could not read session {session}: {exc}")
+        return 1
+
+    reference = load_reference(args.reference) if args.reference else None
+    if reference is None:
+        ref_path = os.path.join(session, "reference.png")
+        if os.path.isfile(ref_path):
+            reference = cv2.imread(ref_path)
+    if reference is None:
+        _log("no reference in the session (and none given with --reference)")
+        return 1
+
+    labels: Dict[int, Tuple[str, str, str]] = {}
+    labels_path = os.path.join(session, "labels.csv")
+    if os.path.isfile(labels_path):
+        with open(labels_path, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                labels[int(row["index"])] = (
+                    row.get("label", "unlabeled"),
+                    row.get("cell", ""),
+                    row.get("phase", ""),
+                )
+
+    detector = R.TouchDetector(
+        reference, threshold=args.threshold, min_area=args.min_area, min_peak=args.min_peak
+    )
+    slip_detector = flow_mod.SlipDetector(
+        shear_threshold=args.slip_shear, centroid_threshold=args.slip_centroid, required=args.slip_required
+    )
+    height, width = reference.shape[:2]
+
+    per_label: Dict[str, Dict[str, object]] = {}
+    loc_errors: List[float] = []
+    loc_errors_px: List[float] = []
+    slip_events = 0
+    slip_frames = 0
+    n_eval = 0
+    prev_gray = None
+    prev_label = None
+    prev_slip = False
+    cell_centers = {name: (cx * width, cy * height) for name, (cx, cy) in PRESS_CELLS}
+
+    for index, frame, _ in rec.iter_session(session, start=args.start, stop=args.stop):
+        label, cell, _phase = labels.get(index, ("unlabeled", "", ""))
+        result = detector.detect(frame)
+        bucket = per_label.setdefault(
+            label, {"frames": 0, "touch_frames": 0, "areas": [], "cells": {}}
+        )
+        bucket["frames"] = int(bucket["frames"]) + 1
+        if result.touch:
+            bucket["touch_frames"] = int(bucket["touch_frames"]) + 1
+            bucket["areas"].append(result.area_px)  # type: ignore[union-attr]
+            if cell:
+                bucket["cells"][cell] = int(bucket["cells"].get(cell, 0)) + 1  # type: ignore[union-attr]
+
+        if label == "press" and result.touch and result.normalized_centroid is not None:
+            cx, cy = cell_centers.get(cell, (width / 2, height / 2))
+            ex = result.normalized_centroid[0] * width - cx
+            ey = result.normalized_centroid[1] * height - cy
+            loc_errors_px.append(float(np.hypot(ex, ey)))
+            loc_errors.append(float(np.hypot(result.normalized_centroid[0] - cx / width,
+                                              result.normalized_centroid[1] - cy / height)))
+
+        if args.slip and (label == "slide" or prev_label == "slide"):
+            gray = P.to_gray(frame)
+            if prev_gray is not None:
+                flow = flow_mod.dense_flow(prev_gray, gray)
+                signed = frame.astype(np.float32) - reference.astype(np.float32)
+                mask = P.contact_mask(
+                    signed, threshold=args.threshold, min_area=args.min_area, region=detector.region
+                )
+                shear = float(flow_mod.shear_from_dense(flow, mask).get("magnitude", 0.0))
+                event = slip_detector.update(result.centroid, shear)
+                if event.slip:
+                    slip_frames += 1
+                    if not prev_slip:
+                        slip_events += 1
+                prev_slip = event.slip
+            prev_gray = gray
+        else:
+            prev_gray = None
+            prev_slip = False
+        prev_label = label
+        n_eval += 1
+
+    summary: Dict[str, object] = {}
+    for label, bucket in per_label.items():
+        n = int(bucket["frames"])
+        touch = int(bucket["touch_frames"])
+        areas = bucket["areas"]  # type: ignore[assignment]
+        summary[label] = {
+            "frames": n,
+            "touch_frames": touch,
+            "touch_ratio": round(touch / n, 4) if n else 0.0,
+            "mean_area_px": round(float(np.mean(areas)), 1) if areas else 0.0,
+        }
+    untouched = summary.get("none", {})
+    fpr = float(untouched.get("touch_ratio", 0.0)) if untouched else None
+    press = summary.get("press", {})
+    object_ = summary.get("object", {})
+    tpr = float(press.get("touch_ratio", 0.0)) if press else None
+    payload: Dict[str, object] = {
+        "session": os.path.abspath(session),
+        "n_frames": meta.n_frames,
+        "n_evaluated": n_eval,
+        "threshold": args.threshold,
+        "min_area": args.min_area,
+        "per_label": summary,
+        "touch": {
+            "tpr_press": tpr,
+            "tpr_object": float(object_.get("touch_ratio", 0.0)) if object_ else None,
+            "fpr_untouched": fpr,
+        },
+        "localisation": {
+            "n": len(loc_errors_px),
+            "mean_px": round(float(np.mean(loc_errors_px)), 2) if loc_errors_px else None,
+            "p90_px": round(float(np.percentile(loc_errors_px, 90)), 2) if loc_errors_px else None,
+            "mean_norm": round(float(np.mean(loc_errors)), 4) if loc_errors else None,
+        },
+        "slip": {"events": slip_events, "frames": slip_frames} if args.slip else None,
+    }
+    _log(json.dumps(payload, indent=2, ensure_ascii=False))
+    out = args.out or os.path.join(session, "eval_session.json")
+    _save_json(out, payload)
+    _log(f"saved {out}")
     return 0
 
 
@@ -994,6 +1253,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frames", type=int, default=None)
     p.add_argument("--threshold", type=float, default=10.0)
     p.add_argument("--min-area", type=int, default=40)
+    p.add_argument("--min-peak", type=float, default=0.0, help="reject blobs weaker than this peak change")
     p.add_argument("--json", action="store_true")
     p.add_argument("--interval", type=float, default=0.5)
     p.add_argument("--fake", action="store_true", help="synthetic source, no sensor")
@@ -1028,6 +1288,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threshold", type=float, default=10.0)
     p.add_argument("--min-area", type=int, default=40)
     p.set_defaults(func=cmd_collect)
+
+    p = sub.add_parser("press-test", help="guided real-press protocol -> labelled session")
+    add_common(p)
+    p.add_argument("--out", default=None, help="session folder (default: sessions/press_<time>)")
+    p.add_argument("--root", default="sessions")
+    p.add_argument("--reference", default=None, help="use an existing reference instead of capturing")
+    p.add_argument("--ref-frames", type=int, default=15)
+    p.add_argument("--untouched-seconds", type=float, default=8.0)
+    p.add_argument("--press-seconds", type=float, default=1.5)
+    p.add_argument("--slide-seconds", type=float, default=8.0)
+    p.add_argument("--object-seconds", type=float, default=1.2)
+    p.add_argument("--object-reps", type=int, default=3)
+    p.add_argument("--no-video", action="store_true")
+    p.add_argument("--yes", action="store_true", help="do not wait for Enter between phases")
+    p.add_argument("--fake", action="store_true", help="synthetic source, no sensor (dry run)")
+    p.add_argument("--fake-reference", default=None)
+    p.set_defaults(func=cmd_press_test)
+
+    p = sub.add_parser("eval-session", help="real TPR/localisation/slip from a labelled session")
+    p.add_argument("session", nargs="?", default="sessions/latest")
+    p.add_argument("--root", default="sessions")
+    p.add_argument("--reference", default=None)
+    p.add_argument("--threshold", type=float, default=10.0)
+    p.add_argument("--min-area", type=int, default=40)
+    p.add_argument("--min-peak", type=float, default=0.0, help="reject blobs weaker than this peak change")
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--stop", type=int, default=None)
+    p.add_argument("--slip", dest="slip", action="store_true", default=True)
+    p.add_argument("--no-slip", dest="slip", action="store_false")
+    p.add_argument("--slip-shear", type=float, default=0.6)
+    p.add_argument("--slip-centroid", type=float, default=1.5)
+    p.add_argument("--slip-required", type=int, default=3)
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=cmd_eval_session)
 
     p = sub.add_parser("synth", help="build a synthetic feature dataset from a reference")
     p.add_argument("--reference", default=None)

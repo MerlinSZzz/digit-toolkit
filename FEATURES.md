@@ -47,8 +47,21 @@ frame rate.
   convention). Channels work: on this unit `R=15,G=0,B=0` gives `R≈105, B≈11`.
 - `set_mode(w, h, fps)` / `set_fps(f)` — **close and reopen** the camera
   instead of reconfiguring a live stream, because a mid-stream fps change
-  wedged this unit once.
+  wedged this unit once. The width/height/fps properties are set only between
+  `open()` and the first read; `_configure` raises if the handle is already
+  streaming, and `set_mode`/`set_fps` never touch the live handle.
 - `measure_fps(n)` — grab `n` frames as fast as possible.
+- **Roll fix** — a YUYV buffer misalignment can wrap the image sideways around
+  a single sharp vertical seam. `detect_roll(frame)` finds the seam (the
+  strongest column-to-column discontinuity, accepted only when it is well
+  above the median and either isolated or very strong) and returns the signed
+  number of columns to roll back; `fix_roll` applies it. `read()` runs this on
+  every frame, so the returned image is un-wrapped. If a correction leaves a
+  strong seam (a per-row misalignment, not a global roll) for
+  `roll_reopen_after` frames, the device is reopened. A physical sideways move
+  does not wrap, so it is left alone. `stats` reports
+  `roll_frames`, `roll_corrected`, `last_roll_shift`, `last_roll_confidence`.
+  `roll_fix=False` disables it.
 
 **Parameters.** Default `640x480 @ 30`, LED 15, warmup 8 frames (the first
 frames after open are dark).
@@ -106,6 +119,48 @@ largest bright region; if the gel is very dark, set `threshold` lower.
 TPR **1.00**, FPR **0.00**; localisation mean error **0.26 px**, 90th
 percentile **0.47 px**; 3x3 cell accuracy **1.00** (see §8 for the exact test).
 
+**Measured (real, untouched):** the 2026-09-24 recording
+(`.logs/real_press_20260924`, 1567 frames / 100 s, 640x480@30 requested) is
+**entirely untouched** — the owner confirmed he did not press. Every frame is a
+false positive by definition, so it measures the real false-positive rate.
+Detector defaults: `threshold=10`, `min_area=40`, reference = the per-pixel
+median of frames 100–160 (frame 0 is an auto-exposure/LED warm-up frame and must
+not be used):
+
+| detection variant | false-positive frames | per-frame FPR |
+| --- | --- | --- |
+| raw frames (no roll fix) | 1489 / 1567 | **0.950** |
+| + roll fix (`detect_roll` + `np.roll`) | 838 / 1567 | **0.535** |
+| + roll fix + adaptive reference (EMA α=0.02 while no contact) | 837 / 1567 | 0.534 |
+| + roll fix + `min_peak=25` (contrast gate) | 172 / 1567 | **0.110** |
+| + roll fix + grayscale magnitude > 15 | 132 / 1567 | 0.084 |
+
+Per region (per-frame FPR after the roll fix): clean 30–184 → 0.574; the ±24 px
+roll bands 215–432 / 1331–1566 → 0.601 / 0.394; the large-roll band 460–1300 →
+0.543. Key findings:
+
+- The **roll artifact dominates** the raw FPR (0.95); un-wrapping removes the
+  geometric false positives, taking the overall rate to 0.54 while leaving the
+  genuinely clean frames unchanged.
+- The residual FPR is **chroma noise**, not geometry. The difference is
+  `max |ΔBGR channel|`; on untouched frames the B/R channels dither by up to
+  ~56 levels while luminance barely moves (grayscale `>5` is < 0.3 % of pixels
+  vs ~25 % for max-channel). A grayscale magnitude, a higher threshold, or the
+  `min_peak` contrast gate removes most of it (`peak_mag` is 19 at the median
+  of the false blobs vs 56 at the 90th percentile).
+- The **steady ~6.4 % step** described in the brief coincides *exactly* with the
+  ±24 px roll bands. After un-wrapping, frames 300 and 1400 differ from the
+  clean reference by ~2–3 grey levels spread uniformly over the whole gel
+  (8x8 block means within ±1 level), per-channel means move by < 0.5, and the
+  grayscale diff std is 1.15 — identical to a clean frame (1.15). It is the
+  capture roll, **not** a press, **not** LED/auto-exposure (brightness is flat),
+  and we cannot attribute it to the cable-strain deformation the owner
+  suspected. An adaptive reference does not help (0.535 → 0.534) precisely
+  because there is no slow drift to track after the roll is fixed.
+- For comparison, a synthetic contact on the real gel has TPR 1.00 / FPR 0.00
+  (above), so the real FPR is a property of the sensor's chroma noise and the
+  max-channel metric, not of the contact model.
+
 ## 4. Relative depth and normals — `digit.processing`
 
 **Computes.**
@@ -152,6 +207,22 @@ background-subtraction assumption (a handheld sensor is fine; a robot finger
 that moves between frames is better served by the GelSight monitor's tuned
 version). The `slip` signal is a report, not an actuator command.
 
+**Measured (real, untouched).** On the same all-untouched 2026-09-24 recording
+(§3), with default thresholds (`shear>=0.6`, `centroid>=1.5`, `required=3`):
+
+| variant | slip frames | slip events |
+| --- | --- | --- |
+| raw frames | 472 / 1567 (30 %) | 42 |
+| + roll fix | 184 / 1567 (12 %) | 51 |
+
+The roll fix removes the geometric false slips (the wrap creates huge global
+flow), but the residual **chroma-noise false positives** still trigger the
+shear channel: a noisy contact mask makes the inside-minus-outside median
+jitter around the 0.6 px threshold for three frames. `MIN_PEAK` does not change
+this because the shear signal is computed from the raw mask; tomorrow's real
+slide test should gate slip on a gated contact or raise `shear_threshold`.
+Treat the untouched slip rate as the false-positive floor.
+
 ## 6. Recording and replay — `digit.recording`
 
 **Computes.** A self-describing session folder: lossless PNG frames +
@@ -167,7 +238,11 @@ mode, LED, start/end, count) + optional `video.avi` and `reference.png`.
 **Limits.** PNG at 640x480 is ~250-400 kB/frame and the default recording is
 uncompressed, so a 30 fps session grows quickly; use `SECONDS=` and the AVI for
 a quick look. Timestamps are host `time.time_ns()` at capture, not the camera's
-hardware clock.
+hardware clock. The achieved rate is limited by the **synchronous PNG write +
+MJPEG encode, not the sensor**: the 2026-09-24 100 s recording captured 1567
+frames (15.7 fps) at a requested 30 fps, while `make fps FPS=30` (no encoding)
+measured ~31 fps. Drop `--video` or record fewer frames if you need the full
+sensor rate.
 
 ## 7. Recognition — `digit.recognition`
 
@@ -213,6 +288,15 @@ you never have to trust a claim you did not measure.
   on the real gel instead of a synthetic reference.
 - `make demo` → renders every processing view from a synthetic animated contact
   (works with no sensor) to `docs/images/`.
+- `make press-test` → a guided **real** protocol (untouched → one finger at six
+  places → slide → a small object), driven by Enter between phases. It captures
+  a reference, writes a normal session folder plus `labels.csv`
+  (index, phase, label, cell) and `protocol.json`. Use it with the person in
+  front of the sensor; `--fake --yes` is a sensor-free dry run.
+- `make eval-session SESSION=...` → reads that folder and reports **real**
+  per-frame TPR/FPR, localisation error against the intended cell centres, and
+  slip events, as JSON in `eval_session.json`. `MIN_PEAK` (default 25) is the
+  contrast gate from §3; set `MIN_PEAK=0` to compare with the raw threshold.
 - `digit.fake.FakeContactSource` is the animated source used by
   `view/monitor/record/predict --fake`; it has the same interface as
   `DigitCamera`.
@@ -223,8 +307,12 @@ are explicitly synthetic.
 
 ## 9. Tests — `make test`
 
-33 pytest tests, all sensor-free (`tests/`): difference/contact/centroid,
+39 pytest tests, all sensor-free (`tests/`): difference/contact/centroid,
 active region, Poisson integration, depth/normal shapes, dense and sparse flow,
 shear background subtraction, slip state machine, touch detection, feature
 determinism, classifier train/save/load, dataset balance, session round-trip,
-CSV timestamps, video export, CLI parser and `selftest`. Run `make test`.
+CSV timestamps, video export, CLI parser and `selftest`. `tests/test_capture.py`
+adds the safety tests: a fake OpenCV capture asserts that **no mode property is
+set while a stream is open** (`set_mode`/`set_fps` must close-and-reopen), that
+`_configure` refuses a live handle, and that `detect_roll` finds/undoes a wrap
+but leaves a clean or physically-panned frame alone. Run `make test`.

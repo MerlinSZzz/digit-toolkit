@@ -61,7 +61,9 @@ the "no contact" image that every later difference is measured against.
 If `make check` says *no sensor found*, see [Troubleshooting](#troubleshooting).
 
 Interactive keys in `make view`: `q`/`Esc` quit, `s` save a screenshot to
-`snapshots/`, `r` re-capture the reference, `p` pause.
+`snapshots/`, `r` re-capture the reference, `p` pause, `[`/`]` step the frame
+rate, `v` toggle 640x480/320x240. Every mode change stopped the reader and
+closed/reopened the device — never a live property change.
 
 ---
 
@@ -133,13 +135,15 @@ Run `make help` for the same list. Every command is a thin wrapper over
 | `make synth` | build a synthetic feature dataset (`datasets/synthetic.npz`) |
 | `make train DATASET=datasets/synthetic.npz MODEL=models/c.pkl` | train + evaluate kNN/SVM/logreg |
 | `make collect LABELS="screw bolt"` | interactively collect labelled **real** samples (you press the object, Enter, then N frames are saved) |
+| `make press-test` | guided **real-press protocol**: untouched → one finger at 6 places → slide → small object; writes a labelled session (`labels.csv`, `protocol.json`) |
+| `make eval-session SESSION=sessions/press_...` | **real** TPR / FPR / localisation error / slip from that session, one command |
 | `make predict MODEL=models/c.pkl` | live prediction with a trained model |
 
 ### Development
 
 | command | what it does |
 | --- | --- |
-| `make test` | 33 sensor-free pytest tests |
+| `make test` | 39 sensor-free pytest tests (adds capture safety + roll fix) |
 | `make selftest` | sensor-free end-to-end smoke test of processing/recognition/recording |
 
 ---
@@ -207,11 +211,31 @@ change is needed: `sudo usermod -aG video "$USER"` then log back in. (On this
 machine `jamie` is already in `video`.)
 
 **No frames, `select() timeout`, or a wedged sensor.**
-A UVC/DIGIT can wedge after an unlucky reconfiguration or a suspend. Recover
-with a soft reset if you have the udev rule: `make reset`. Otherwise replug the
-sensor, or run `sudo make reset`. **Do not** change fps/resolution repeatedly
-while it is streaming; the toolkit reopens the camera for a mode change to
-avoid this, but other programs may not.
+A UVC/DIGIT can wedge after an unlucky reconfiguration or a suspend. On
+2026-09-24 a live frame-rate change (`cap.set(CAP_PROP_FPS)`) on an already
+streaming handle wedged this unit until it was physically replugged. **Do not
+change fps/resolution mid-stream**; the toolkit now closes and reopens the
+device for every mode change (`DigitCamera.set_mode`, and the `[`/`]`/`v` keys
+in `make view`), so the mode is always applied before the first read. Other
+programs may still poke a live stream. To recover, replug the sensor, or
+install the udev rule once (`make install-udev`) so the soft reset works:
+`make reset` (without the rule it needs `sudo make reset`).
+
+**The image shifts sideways and wraps with a seam (a rolled frame).**
+A YUYV buffer misalignment can wrap the image around a vertical seam; it is a
+capture artifact, not contact. `DigitCamera.read()` detects the wrap (one
+sharp, isolated column discontinuity) and rolls it back before returning the
+frame; if a roll does not clear after a few frames it reopens the device.
+`detect_roll`/`fix_roll` in `digit.capture` expose the test. A *physical*
+sideways move of the sensor does not wrap, so it is left alone — re-capture the
+reference after moving the sensor.
+
+**The reference goes stale / a broad low-contrast change appears.**
+Cable tension or a small shift of the sensor on the table deforms the gel
+slightly, and the difference against an old reference lights up across the
+whole gel. Secure the cable, avoid pulling it, and re-take the reference
+(`make reference` or the `r` key) after any move. A localised, high-contrast
+blob is contact; a broad, low-contrast change is not.
 
 **Wrong node / "opened but no frames".**
 Use `make list` and the stable path

@@ -61,7 +61,14 @@ class TouchResult:
 
 
 class TouchDetector:
-    """Threshold-based touch detector with optional background cancellation."""
+    """Threshold-based touch detector with optional background cancellation.
+
+    ``min_peak`` is an optional contrast gate: a candidate blob is only reported
+    as touch if its ``peak_mag`` (the strongest per-pixel change) reaches it.
+    This separates a **localised** contact from a broad, low-contrast
+    disturbance such as cable strain or a small shift of the sensor, which can
+    light up the difference over a wide area without any sharp contact edge.
+    """
 
     def __init__(
         self,
@@ -69,10 +76,12 @@ class TouchDetector:
         threshold: float = 10.0,
         min_area: int = 40,
         region: Optional[np.ndarray] = None,
+        min_peak: float = 0.0,
     ) -> None:
         self.reference = reference
         self.threshold = float(threshold)
         self.min_area = int(min_area)
+        self.min_peak = float(min_peak)
         from .processing import active_region
 
         self.region = active_region(reference) if region is None else region
@@ -86,8 +95,9 @@ class TouchDetector:
         stats = contact_stats(mask, signed, region=self.region)
         centroid = stats.centroid
         norm = localize(stats, frame.shape)
+        touch = bool(stats.touch) and stats.peak_mag >= self.min_peak
         return TouchResult(
-            touch=stats.touch,
+            touch=touch,
             area_px=stats.area_px,
             area_frac=stats.area_frac,
             centroid=centroid,
