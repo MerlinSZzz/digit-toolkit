@@ -175,6 +175,35 @@ def shear_from_dense(flow: np.ndarray, mask: Optional[np.ndarray] = None) -> Dic
     return {"magnitude": float(np.median(inside)), "inside": float(np.median(inside)), "outside": 0.0}
 
 
+def frame_change_energy(
+    prev: np.ndarray,
+    curr: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    region: Optional[np.ndarray] = None,
+) -> Optional[float]:
+    """Mean absolute grayscale change ``|curr - prev|`` inside a mask/region.
+
+    This is the small-motion L1 proxy for tangential texture flow: for a still
+    press the contact texture does not move and the energy is the sensor noise
+    floor, while a sliding contact moves the texture and raises it.  Dense
+    Farneback returns ~0 on this smooth gel (see FEATURES.md), so the frame
+    change is the estimator that actually separates slide from still press.
+    Returns ``None`` when the mask/region is empty.
+    """
+    a = np.abs(to_gray(curr).astype(np.float32) - to_gray(prev).astype(np.float32))
+    if mask is not None:
+        sel = mask > 0
+        if region is not None:
+            sel = sel & (region > 0)
+    elif region is not None:
+        sel = region > 0
+    else:
+        sel = np.ones(a.shape, dtype=bool)
+    if not sel.any():
+        return None
+    return float(a[sel].mean())
+
+
 @dataclass
 class SlipEvent:
     slip: bool
@@ -241,4 +270,58 @@ class SlipDetector:
             magnitude=float(shear_magnitude),
             centroid_speed=speed,
             reason=reason or "stable",
+        )
+
+
+class TextureSlipDetector:
+    """Slip from **tangential motion of the contact texture**, gated on touch.
+
+    Keeps a short ring of grayscale frames and compares the current frame with
+    the one ``lag`` frames back (``lag=5`` ~ 0.16 s at 30 fps, enough for the
+    slow slide of the protocol to move the texture by more than sensor noise).
+    The signal is :func:`frame_change_energy` inside the touch mask; it fires
+    only after ``required`` consecutive frames above ``threshold``.  It never
+    uses the contact centroid, which is what made the old detector jitter on a
+    held press.
+    """
+
+    def __init__(
+        self,
+        threshold: float = 1.6,
+        required: int = 3,
+        lag: int = 5,
+    ) -> None:
+        self.threshold = float(threshold)
+        self.required = int(required)
+        self.lag = int(lag)
+        self._grays: Deque[np.ndarray] = deque(maxlen=max(1, self.lag + 1))
+        self._hits: Deque[bool] = deque(maxlen=max(1, self.required))
+
+    def update(
+        self,
+        frame: np.ndarray,
+        touch: bool,
+        mask: Optional[np.ndarray] = None,
+        region: Optional[np.ndarray] = None,
+    ) -> SlipEvent:
+        self._grays.append(to_gray(frame))
+        energy: Optional[float] = None
+        if touch and len(self._grays) > self.lag:
+            energy = frame_change_energy(self._grays[0], self._grays[-1], mask, region)
+        hit = bool(touch and energy is not None and energy >= self.threshold)
+        self._hits.append(hit)
+        good = sum(self._hits) >= self.required
+        if not touch:
+            reason = "no_touch"
+        elif energy is None:
+            reason = "no_mask"
+        elif good:
+            reason = "texture"
+        else:
+            reason = "stable"
+        return SlipEvent(
+            slip=bool(good and touch),
+            magnitude=float(energy) if energy is not None else 0.0,
+            centroid_speed=0.0,
+            reason=reason,
         )

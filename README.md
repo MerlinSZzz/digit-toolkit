@@ -42,6 +42,22 @@ The sensor produces a colour image with a bright, slightly rainbow-lit gel and
 a dark housing border. The toolkit auto-detects the usable gel area
 (`processing.active_region`) so the border is never counted as contact.
 
+### Which end is up
+
+The owner holds the sensor with the **rounded end up** (an arrow on the back
+points that way) and the **square cable end down**. The raw buffer is
+landscape; the camera's *official* portrait view (`transpose` + vertical flip)
+is **left-right mirrored** relative to the operator, while up is already up.
+`DigitCamera(orientation="operator")` (the CLI default) therefore flips x, so
+the live view and every processing view show the sensor as it is held; pass
+`--orientation official` or `--raw` for the stored camera views. Sessions
+record their `frame_orientation` in `meta.json`, and
+`digit.orientation.to_operator` converts an older official-frame session.
+`docs/images/real_20260925_orientation.png` is the picture of which end is up
+(top = rounded end, bottom = cable, and the stored frame mirrored below).
+
+![DIGIT orientation: rounded end up, cable down, official portrait is x-mirrored](docs/images/real_20260925_orientation.png)
+
 ---
 
 ## Five-minute quick start
@@ -137,6 +153,7 @@ Run `make help` for the same list. Every command is a thin wrapper over
 | `make collect LABELS="screw bolt"` | interactively collect labelled **real** samples (you press the object, Enter, then N frames are saved) |
 | `make press-test` | guided **real-press protocol**: untouched → one finger at 6 places → slide → small object; writes a labelled session (`labels.csv`, `protocol.json`); the stored reference is the median of its own untouched frames |
 | `make eval-session SESSION=sessions/press_...` | **real** TPR / FPR / localisation error / slip from that session; rebuilds the reference from the session's untouched phase (`REFERENCE=` overrides) |
+| `python examples/eval_session_holdout_d4.py SESSION` | honest half/half held-out run: orientation check, per-cell localisation (brightness and lighting-invariant deformation), slip events per label |
 | `make predict MODEL=models/c.pkl` | live prediction with a trained model |
 
 ### Development
@@ -192,8 +209,9 @@ with DigitCamera() as cam:                 # opens /dev/video0 at 640x480@30
 ```
 
 `DigitCamera` picks the capture node automatically, applies the official
-orientation, and supports per-channel LED control. See
-[`FEATURES.md`](FEATURES.md) for every parameter.
+portrait transform and then the `orientation=` preset (default `operator`, the
+sensor as held; `--raw` for the native buffer), and supports per-channel LED
+control. See [`FEATURES.md`](FEATURES.md) for every parameter.
 
 ---
 

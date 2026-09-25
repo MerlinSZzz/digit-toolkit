@@ -171,6 +171,12 @@ def record(
     """
     if outdir is None:
         outdir = os.path.join(root, name or _now_stamp())
+    extra: Dict[str, object] = {}
+    if hasattr(camera, "orientation_name"):
+        try:
+            extra["frame_orientation"] = camera.orientation_name()
+        except Exception:  # noqa: BLE001 - never fail a recording over a label
+            pass
     writer = SessionWriter(
         outdir,
         serial=camera.serial or "",
@@ -181,6 +187,7 @@ def record(
         led=camera.led,
         save_video=save_video,
         reference=reference,
+        extra=extra,
     )
     count = 0
     t0 = time.time()

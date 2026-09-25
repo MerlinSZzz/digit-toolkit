@@ -208,6 +208,72 @@ def force_proxy(signed: np.ndarray, mask: np.ndarray) -> float:
     return float(m[mask > 0].sum()) if mask.any() else 0.0
 
 
+# ---------------------------------------------------------------------------
+# lighting-invariant deformation localisation
+# ---------------------------------------------------------------------------
+
+
+def deformation_map(
+    frame: np.ndarray,
+    reference: np.ndarray,
+    sigma: float = 40.0,
+    post_sigma: float = 30.0,
+) -> np.ndarray:
+    """Signed high-pass grayscale difference: the gel's **deformation** signal.
+
+    The strongest frame change is often a broad illumination change (a hand or
+    finger shadowing the LEDs), so the raw difference follows the lighting.
+    Subtracting a large-scale Gaussian removes that smooth component and keeps
+    the sharp, local bright/dark lobes a pressed indentation makes::
+
+        d   = gray(frame) - gray(reference)
+        hp  = d - GaussianBlur(d, sigma)      # remove the broad lighting term
+        out = GaussianBlur(hp, post_sigma)    # aggregate the lobes
+
+    Returns a float32 ``(H, W)`` map.  See :func:`deformation_centroid`.
+    """
+    d = to_gray(frame).astype(np.float32) - to_gray(reference).astype(np.float32)
+    hp = d - cv2.GaussianBlur(d, (0, 0), float(sigma))
+    if post_sigma and post_sigma > 0:
+        hp = cv2.GaussianBlur(hp, (0, 0), float(post_sigma))
+    return hp.astype(np.float32)
+
+
+def deformation_centroid(
+    dmap: np.ndarray,
+    region: Optional[np.ndarray] = None,
+    quantile: float = 0.3,
+) -> Optional[Tuple[float, float]]:
+    """Contact centroid from a :func:`deformation_map` (lighting-independent).
+
+    An indentation makes a bright lobe on one side and a dark lobe on the
+    other, so we take the centroid of each lobe's strong pixels and average
+    them, weighted by lobe strength.  That cancels the common offset of the
+    lighting-induced bright/dark pair.  Returns ``(x, y)`` pixels or ``None``
+    when the map is flat.
+    """
+    m = dmap
+    if region is not None:
+        m = m * (region > 0)
+    pts = []
+    for lobe in (np.maximum(m, 0.0), np.maximum(-m, 0.0)):
+        peak = float(lobe.max())
+        if peak <= 0:
+            continue
+        ys, xs = np.nonzero(lobe >= float(quantile) * peak)
+        if xs.size:
+            pts.append((float(xs.mean()), float(ys.mean()), peak))
+    if not pts:
+        return None
+    if len(pts) == 1:
+        return pts[0][0], pts[0][1]
+    w0, w1 = pts[0][2], pts[1][2]
+    if w0 + w1 <= 0:
+        return pts[0][0], pts[0][1]
+    return ((pts[0][0] * w0 + pts[1][0] * w1) / (w0 + w1),
+            (pts[0][1] * w0 + pts[1][1] * w1) / (w0 + w1))
+
+
 def localize(stats: ContactStats, shape: Tuple[int, int]) -> Optional[Tuple[float, float]]:
     """Centroid as normalized ``(x/W, y/H)`` in ``0..1``."""
     if stats.centroid is None:

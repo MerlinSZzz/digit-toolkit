@@ -38,9 +38,19 @@ toolkit ships it, but the fallback table is used if it is missing.
 
 **Computes.** BGR frames in the official portrait orientation
 (`transpose` + vertical flip, the `digit-interface` convention), plus the live
-frame rate.
+frame rate.  `orientation=` then selects the preset applied on top:
 
-- `DigitCamera(serial, node, width, height, fps, orientation, led, warmup)`.
+- `"official"` (or `True`) — the stored portrait view (the historical default);
+- `"operator"` (default for the CLI) — the sensor **as the operator holds it**:
+  rounded end up, square cable end down, left/right not mirrored.  It is the
+  official portrait flipped left-right (`cv2.flip(frame, 1)`), see §2b;
+- `"raw"` (or `False`) — the sensor-native landscape buffer, no transform;
+- a `{"rotate": 0, "flip_x": true, "flip_y": false}` dict for anything else.
+
+`DigitCamera(serial, node, width, height, fps, orientation, led, warmup)`.
+`orientation_name()` returns the preset name recorded in a session's
+`meta.json` (`frame_orientation`), so replay knows how the frames were stored.
+
 - `open()` / `read()` / `close()` / context manager.
 - `set_led(level)` and `set_led_rgb(r, g, b)` — 0..15 per channel, packed as
   `(r<<8)|(g<<4)|b` into the UVC "Zoom, Absolute" control (the official DIGIT
@@ -76,6 +86,37 @@ throw `EPROTO -71`); always set the LED through `DigitCamera`.
 USB drop, publishing the newest frame to `wait_new(last_seq)` with `fps`,
 `connected` and `error` properties.
 
+## 2b. Orientation — `digit.orientation`
+
+**Computes.** The transform from the stored camera frame to the sensor as the
+operator holds it.  The owner's answer (2026-09-25) is the ground truth: the
+**rounded end is "up"** (an arrow on the back points that way) and the
+**square cable end is down**.  Pressing the guided protocol at the operator's
+top-left and finding the contact at the *upper right* of the official portrait
+frame identifies the stored frame as **left-right mirrored**; **up is already
+up** (no vertical flip, no rotation).
+
+- `orient(frame, rotate=0, flip_x=False, flip_y=False)` — flips then rotates.
+- `apply_preset(frame, "official" | "operator" | "raw" | dict)`.
+- `PRESETS`, `DEFAULT = "operator"`, `resolve(spec)`.
+- `session_frame_orientation(session)` reads `meta.json.frame_orientation`;
+  `to_operator(frame, source)` converts a stored frame to the operator view.
+
+**How it was confirmed on the 2026-09-25 session.**  Even the noisy D3
+detector, once the frames are x-mirrored to the operator view, puts the six
+presses in the correct layout and cuts the mean localisation error from
+**173.5 px (identity)** to **56.2 px (flip_x)**; `flip_y` (327.7 px) and
+`rot180` (247.4 px) are far worse, and only `flip_x` passes the
+top-above-middle-above-bottom / left-right layout test.  See
+`docs/images/real_20260925_orientation.png` (the rounded end is labelled UP and
+the stored frame is shown mirrored below) and
+`docs/images/real_20260925_press_montage_corrected.png` (the six cells in the
+operator view).
+
+**Measured (synthetic `test_orientation_d4.py`).** `operator` is exactly
+`cv2.flip(official, 1)`; `orient` flips/rotates as specified and a missing
+`meta.json` defaults to `official` (every session recorded before D4).
+
 ## 3. Difference and contact — `digit.processing`
 
 **Computes.**
@@ -95,6 +136,11 @@ USB drop, publishing the newest frame to `wait_new(last_seq)` with `fps`,
 - `localize(stats, shape)` → centroid normalised to `0..1`.
 - `grid_cell(normalized, rows=3, cols=3)` → `"top-left"`, `"middle-center"`, ...
 - `force_proxy(signed, mask)` → `sum(magnitude over mask)`, arbitrary units.
+- `deformation_map(frame, reference, sigma=40, post_sigma=30)` → signed
+  high-pass grayscale difference: the broad lighting term is removed with a
+  large Gaussian, leaving the sharp bright/dark lobes of an indentation.
+  **Lighting-invariant** localisation (`deformation_centroid(dmap, region,
+  quantile=0.3)` averages the two lobes' centroids, weighted by lobe strength).
 - `TactileProcessor(reference, threshold, min_area, diff_gain, depth, smooth)`
   — bundles all of the above per frame into a `TactileFrame`.
 
@@ -205,58 +251,52 @@ same session gives untouched FPR **0.004** (1/251), press TPR **0.9965**,
 object TPR **1.00**, slide touch 1.00, localisation mean 157.7 px -- so the
 touch/no-touch fix is the reference, not the tuning.
 
-**Held-out localisation is poor and we say so.**  Cell centres are the
-normalised `(x/W, y/H)` values in `protocol.json` (`top-left (0.25,0.25)` ...
-`bottom-center (0.5,0.75)`), multiplied by the stored frame size W=480, H=640
-(the official DIGIT orientation): `(120,160), (240,160), (360,160), (120,320),
-(360,320), (240,480)`.  On half B the `TouchDetector` centroid error is:
+**Held-out localisation is usable after correcting the orientation and retuning.**
+Working in the operator view (x-mirrored from the stored official portrait, §2b),
+the 2026-09-25 session's half-B press frames (tuned on half A) give:
 
-| cell | frames | raw cell centre | x-mirrored centre |
+- **Retuned brightness mask** (`threshold=15`, `min_area=30`, `min_peak=45`):
+  overall **39.4 px** mean (median 33.9), 3x3 cell accuracy **0.986**;
+- **Lighting-invariant deformation** (`deformation_map` sigma 40 / post 30,
+  `deformation_centroid` quantile 0.3): overall **56.2 px** mean (median 53.0),
+  cell accuracy **0.811**.
+
+| cell | brightness mask | deformation | frames |
 | --- | --- | --- | --- |
-| top-left | 24 | 162.0 px | 93.3 px |
-| top-center | 24 | 63.0 px | 63.0 px |
-| top-right | 24 | 212.5 px | 31.9 px |
-| middle-left | 23 | 274.0 px | 136.6 px |
-| middle-right | 24 | 241.2 px | 101.7 px |
-| bottom-center | 24 | 110.2 px | 110.2 px |
-| **overall** | **143** | **176.5 px** (p90 272) | **89.1 px** |
+| top-left | 36.4 px | 58.0 px | 24 |
+| top-center | 54.8 px | 97.3 px | 24 |
+| top-right | 20.0 px | 33.4 px | 24 |
+| middle-left | 17.3 px | 26.1 px | 23 |
+| middle-right | 36.9 px | 73.5 px | 24 |
+| bottom-center | 76.4 px | 47.4 px | 20 |
+| **overall** | **39.4 px** | **56.2 px** | **139 / 143** |
 
-The left/right order is **mirrored** in the stored frame relative to the
-operator's view (the camera looks at the gel from behind), which is why
-mirroring the x centre helps.  But even mirrored the error is ~89 px and the
-per-cell values are not consistent, and the per-pixel temporal variance of the
-press phases peaks at unrelated places (e.g. `bottom-center` at y=229 instead
-of 480).  The reason is visible in the images: on this session the dominant
-frame difference is a broad, roughly stationary illumination/shadow change
-(the hand/finger occluding the LED), so the union-mask centroid is not the
-finger position.  **Localisation is not usable on this session**; the touch
-flag is.
+Both beat D3's 176.5 px (and its x-mirrored 89.1 px) by a wide margin, so
+**localisation is usable** on this session.  The brightness mask is numerically
+best because the finger's shadow is co-located with the contact and a low
+threshold averages over it; the deformation method is the one that does **not
+follow the lighting** (`deformation_map` removes the broad smooth lighting term
+and keeps the sharp bright/dark dipole of the indentation) and is the more
+robust choice when the illumination is uncontrolled.  D3's poor number came
+mostly from a too-strict mask (`threshold=35` kept only the shadow edge) plus
+the uncorrected mirror, not from an absent contact signal.  Per-frame, the
+grayscale deformation signal is only a few levels, so this is a *tuned* result:
+`examples/eval_session_holdout_d4.py` reports every number above.
 
-**Images** (`docs/images/real_20260925_*`, tuned mask, magenta X = protocol
-cell centre, yellow X = x-mirrored centre, red cross = mask centroid):
+**Images** (`docs/images/real_20260925_*`, operator view, magenta X = protocol
+cell centre, green cross = retuned brightness-mask centroid, red cross =
+lighting-invariant deformation centroid; one sentence each):
 
-- `real_20260925_press_top-left.png` (frame 256): the mask sits at the
-  upper-centre (~170,120) rather than the magenta top-left centre (120,160),
-  so the centroid is ~150 px away; the bright green band is above the mask.
-- `real_20260925_press_top-center.png` (frame 301): the mask/centroid (~210,120)
-  is the closest to its cell centre (~63 px), just above the magenta X.
-- `real_20260925_press_top-right.png` (frame 349): the mask is still at the
-  top-centre, ~212 px from the magenta top-right centre but only ~32 px from
-  the yellow mirrored centre -- the clearest single sign of the left/right
-  mirror.
-- `real_20260925_press_middle-left.png` (frame 395): the mask is at the
-  upper-left-centre (~185,170), ~274 px from the magenta middle-left centre,
-  with the dark blue shadow dominating the difference.
-- `real_20260925_press_middle-right.png` (frame 462): the mask/centroid
-  (~205,175) is ~241 px from the magenta centre and ~102 px from the mirrored
-  one; the orange/pink contact patch is left of centre.
-- `real_20260925_press_bottom-center.png` (frame 490): the mask is at
-  y~200, ~110 px from the magenta centre at y=480 -- the contact is nowhere
-  near the bottom of the gel.
-- `real_20260925_press_montage.png`: the six tiles above in one sheet.
-- `real_20260925_slide_slip.png` (frames 606-612): a tiny (~1,000 px) mask at
-  the top of the gel wiggles, shear stays ~0.0 px, and `slip` flips True at
-  frame 609 -- a centroid-jitter false positive, not a sliding contact.
+- `real_20260925_press_montage_corrected.png`: the six press cells side by side
+  in the operator view (frames 276/324/372/418/467/515); every green centroid
+  lands in its own 3x3 cell, and the top row is above the middle row, which is
+  above bottom-centre.
+- `real_20260925_orientation.png`: the operator view labelled "rounded end =
+  UP" and "cable / square end = DOWN", above the stored official portrait with
+  the same red marker mirrored -- the picture of which end is up.
+- `real_20260925_slide_slip_d4.png`: the slide phase's touch-gated
+  texture-motion energy with the slip threshold and the fired frames (top),
+  and six slide frames with the green touch mask (bottom).
 
 ## 4. Relative depth and normals — `digit.processing`
 
@@ -295,6 +335,11 @@ in `tests/test_processing.py`.
 - `SlipDetector(shear_threshold=0.6, centroid_threshold=1.5, required=3)` →
   state machine combining shear and contact-centroid speed; requires
   `required` consecutive agreeing frames to report `slip=True`.
+- `frame_change_energy(prev, curr, mask, region)` → mean `|grayΔ|` inside the
+  mask, the small-motion proxy for tangential texture flow.
+- `TextureSlipDetector(threshold=1.6, required=3, lag=5)` → keeps a short ring
+  of frames, compares frame `i` with frame `i-lag` inside the touch mask, and
+  fires only when gated on touch -- it never uses the contact centroid.
 
 **Limits.** On a gel with little texture the sparse tracker finds few corners;
 `shear.quality` reports the fraction of surviving contact corners. Dense flow
@@ -320,21 +365,34 @@ this because the shear signal is computed from the raw mask; tomorrow's real
 slide test should gate slip on a gated contact or raise `shear_threshold`.
 Treat the untouched slip rate as the false-positive floor.
 
-**Measured (real, 2026-09-25 press session, slide).**  With the same session
-reference and the tuned mask (`threshold=35`, `min_area=30`) and the default
-`SlipDetector` (`shear>=0.6`, `centroid>=1.5`, `required=3`), slip fires in
-**24/252 slide frames** (3 events) but also in **138/287 press frames** (28
-events, 18 events on the stable middle of each press phase) and in **0/251
-untouched frames**.  Raising the shear threshold from 0.6 to 4.0 changes
-nothing: the shear channel stays below 0.6 px/frame, and every detected event
-comes from the **centroid** channel jittering as the small, threshold-fragile
-mask moves.  On `slide` the mask is only ~1,000 px at the top of the gel and
-the inside-minus-outside shear falls back to ~0.0 px, so the detector is not
-seeing the sliding contact at all.  **Slip is not usable on this session**: it
-fires during slide (so the channel is not dead) but it is not specific -- it
-fires more during a held press than during the slide -- because the contact
-mask is dominated by the broad illumination change, not a stabilised
-indentation.
+**Measured (real, 2026-09-25 press session, slide).**  The old
+`SlipDetector` was not specific: with the tuned mask it fired in 138/287 press
+frames (28 events) but only 24/252 slide frames (3), all from **centroid
+jitter** (shear stayed below 0.6 px/frame).  Dense Farneback flow is degenerate
+on this smooth gel (frame-to-frame `median |flow|` is ~0.0 px), so D4 replaces
+it with `frame_change_energy`: the mean `|gray(frame) - gray(frame_5)|` inside
+the touch mask (a small-motion L1 proxy for tangential texture flow), gated on
+the shipped `TouchDetector` (`threshold=10`, `min_area=40`, `min_peak=25`) and
+fired after 3 consecutive frames above the threshold.  The detector
+(`TextureSlipDetector`, `threshold=1.3`, `lag=5`, `required=3`) never uses the
+centroid.  Half-B held-out numbers (`examples/eval_session_holdout_d4.py`):
+
+| label | held-out frames | slip frames | events | stable-middle events |
+| --- | --- | --- | --- | --- |
+| untouched | 125 | 0 | 0 | 0 |
+| press | 143 | 8 | 3 | **0** |
+| slide | 126 | 100 | 4 | 4 |
+| object | 57 | 7 | 1 | 0 |
+
+So on this session slip **fires on slide and not on a still press** (0
+stable-middle press events; the 3 press events are all in the first/last
+frames of a phase, i.e. the finger arriving/leaving).  The slide signal is
+clearly higher than the noise floor: untouched energy ~1.19, still press
+~1.19, slide ~1.6-2.0 grayscale levels.  The event count is low only because
+the operator slides continuously, so one "event" is a long run; the fired-
+frame counts (100 vs 0) are the meaningful separation.  For comparison the
+inside-mask and the whole-gel variant agree (slide 100 vs 96 fired frames).
+`docs/images/real_20260925_slide_slip_d4.png` shows the signal and the mask.
 
 ## 6. Recording and replay — `digit.recording`
 
@@ -437,6 +495,12 @@ but leaves a clean or physically-panned frame alone. `tests/test_session_eval.py
 adds three sensor-free tests: the reference is built from the session's own
 untouched phase (not a stale `reference.png`), `eval-session` reports FPR 0 on
 untouched frames where the stale reference gives FPR 1, and the `eval-session`
-CLI defaults equal the Makefile's `THRESHOLD`/`MIN_AREA`/`MIN_PEAK`. Run
-`make test`.  `examples/eval_session_holdout.py` is the reproducible half/half
-evaluation used for the real 2026-09-25 numbers above.
+CLI defaults equal the Makefile's `THRESHOLD`/`MIN_AREA`/`MIN_PEAK`.
+`tests/test_orientation_d4.py` adds eight more: the `operator` preset is
+`flip_x` of `official`, the `raw`/`official`/`operator` resolution and the
+missing-`frame_orientation` default, `deformation_centroid` recovering a
+synthetic local dipole while ignoring a broad brightness shift, and
+`TextureSlipDetector` firing only on touch **and** motion. Run `make test`.
+`examples/eval_session_holdout_d4.py` is the reproducible half/half evaluation
+used for the real 2026-09-25 numbers above (the older
+`examples/eval_session_holdout.py` is the D3 version, kept for provenance).

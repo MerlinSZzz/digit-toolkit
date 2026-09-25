@@ -24,6 +24,7 @@ from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
 
+from . import orientation as orientation_mod
 from .device import DigitInfo, find_digit
 
 #: UVC "Zoom, Absolute" control is reused by DIGIT firmware for the LEDs.
@@ -136,7 +137,7 @@ class DigitCamera:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
-        orientation: bool = True,
+        orientation: "orientation_mod.OrientationSpec" = True,
         led: Optional[int] = LED_MAX,
         warmup: int = 8,
         buffersize: int = 1,
@@ -149,7 +150,9 @@ class DigitCamera:
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
-        self.orientation = bool(orientation)
+        # ``orientation`` may be a bool (True = official portrait), a preset
+        # name ("official"/"operator"/"raw") or a rotate/flip dict.
+        self.orientation = orientation
         self.led = led
         self.warmup = int(warmup)
         self.buffersize = int(buffersize)
@@ -245,12 +248,29 @@ class DigitCamera:
         frame = self._read_raw()
         self._last_shape = frame.shape
         if self.orientation:
+            # official DIGIT convention: landscape buffer -> upright portrait
             frame = cv2.flip(cv2.transpose(frame), 0)
+            # then the requested preset (e.g. "operator" mirrors left-right)
+            frame = orientation_mod.apply_preset(frame, self.orientation)
         return frame
 
-    def read(self) -> np.ndarray:
-        """Return one BGR frame in the official orientation.
+    def orientation_name(self) -> str:
+        """The stored-frame orientation name recorded in a session's meta."""
+        try:
+            spec = orientation_mod.resolve(self.orientation)
+        except (TypeError, ValueError):
+            return "official"
+        if spec.get("raw"):
+            return "raw"
+        if not spec["flip_x"] and not spec["flip_y"] and not spec["rotate"]:
+            return "official"
+        return "operator"
 
+    def read(self) -> np.ndarray:
+        """Return one BGR frame in the configured orientation.
+
+        The camera's official portrait transform is applied first, then the
+        ``orientation=`` preset (``operator`` by default: the sensor as held).
         With ``roll_fix=True`` (default) each frame is checked for the wrapped
         YUYV buffer misalignment that shifts the image sideways, and the wrap is
         undone.  If a roll does not clear after re-sync for several frames the

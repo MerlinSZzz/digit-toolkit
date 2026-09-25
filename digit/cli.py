@@ -18,6 +18,7 @@ import numpy as np
 
 from . import __version__
 from . import flow as flow_mod
+from . import orientation as orientation_mod
 from . import processing as P
 from . import recognition as R
 from . import recording as rec
@@ -58,11 +59,18 @@ def _camera_from_args(args, open_now: bool = True):
         height=height,
         fps=int(getattr(args, "fps", 30) or 30),
         led=getattr(args, "led", 15),
-        orientation=not getattr(args, "raw", False),
+        orientation=_orientation_from_args(args),
     )
     if open_now:
         camera.open()
     return camera
+
+
+def _orientation_from_args(args):
+    """Orientation spec from the CLI: ``--raw`` wins, else ``--orientation``."""
+    if getattr(args, "raw", False):
+        return "raw"
+    return getattr(args, "orientation", None) or orientation_mod.DEFAULT
 
 
 def _parse_resolution(text: str) -> Tuple[int, int]:
@@ -692,6 +700,7 @@ def cmd_press_test(args) -> int:
             led=camera.led,
             save_video=not args.no_video,
             reference=reference,
+            extra={"frame_orientation": camera.orientation_name()},
         )
         labels_fh = open(os.path.join(outdir, "labels.csv"), "w", newline="", encoding="utf-8")
         labels_w = csv.writer(labels_fh)
@@ -819,11 +828,17 @@ def cmd_eval_session(args) -> int:
         _log("no reference in the session (and none given with --reference)")
         return 1
 
+    # Everything below works in the operator view (rounded end up, sensor as
+    # held).  Old sessions stored the official portrait view, which is
+    # left-right mirrored relative to it; newer ones record their orientation.
+    stored_orientation = orientation_mod.session_frame_orientation(session)
+    reference = orientation_mod.to_operator(reference, stored_orientation)
+
     detector = R.TouchDetector(
         reference, threshold=args.threshold, min_area=args.min_area, min_peak=args.min_peak
     )
-    slip_detector = flow_mod.SlipDetector(
-        shear_threshold=args.slip_shear, centroid_threshold=args.slip_centroid, required=args.slip_required
+    slip_detector = flow_mod.TextureSlipDetector(
+        threshold=float(getattr(args, "slip_threshold", 1.6)), required=args.slip_required
     )
     height, width = reference.shape[:2]
 
@@ -842,6 +857,7 @@ def cmd_eval_session(args) -> int:
     cell_centers = {name: (cx * width, cy * height) for name, (cx, cy) in PRESS_CELLS}
 
     for index, frame, _ in rec.iter_session(session, start=args.start, stop=args.stop):
+        frame = orientation_mod.to_operator(frame, stored_orientation)
         label, cell, _phase = labels.get(index, ("unlabeled", "", ""))
         result = detector.detect(frame)
         bucket = per_label.setdefault(
@@ -867,24 +883,18 @@ def cmd_eval_session(args) -> int:
         if label == "press":
             cell_frames[cell] = cell_frames.get(cell, 0) + 1
 
-        if args.slip and (label == "slide" or prev_label == "slide"):
-            gray = P.to_gray(frame)
-            if prev_gray is not None:
-                flow = flow_mod.dense_flow(prev_gray, gray)
-                signed = frame.astype(np.float32) - reference.astype(np.float32)
-                mask = P.contact_mask(
-                    signed, threshold=args.threshold, min_area=args.min_area, region=detector.region
-                )
-                shear = float(flow_mod.shear_from_dense(flow, mask).get("magnitude", 0.0))
-                event = slip_detector.update(result.centroid, shear)
-                if event.slip:
-                    slip_frames += 1
-                    if not prev_slip:
-                        slip_events += 1
-                prev_slip = event.slip
-            prev_gray = gray
+        if args.slip:
+            signed = frame.astype(np.float32) - reference.astype(np.float32)
+            mask = P.contact_mask(
+                signed, threshold=args.threshold, min_area=args.min_area, region=detector.region
+            )
+            event = slip_detector.update(frame, result.touch, mask=mask, region=detector.region)
+            if event.slip:
+                slip_frames += 1
+                if not prev_slip:
+                    slip_events += 1
+            prev_slip = event.slip
         else:
-            prev_gray = None
             prev_slip = False
         prev_label = label
         n_eval += 1
@@ -1170,6 +1180,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--resolution", default=None, help="WxH, e.g. 640x480")
         p.add_argument("--fps", type=int, default=30)
         p.add_argument("--led", type=int, default=15, help="LED level 0..15")
+        p.add_argument(
+            "--orientation",
+            choices=sorted(orientation_mod.PRESETS),
+            default=orientation_mod.DEFAULT,
+            help="frame orientation: 'operator' (as held; default) or 'official' (stored portrait)",
+        )
         p.add_argument("--raw", action="store_true", help="sensor-native orientation")
 
     p = sub.add_parser("list", help="list DIGIT video nodes")
@@ -1357,6 +1373,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slip-shear", type=float, default=0.6)
     p.add_argument("--slip-centroid", type=float, default=1.5)
     p.add_argument("--slip-required", type=int, default=3)
+    p.add_argument("--slip-threshold", type=float, default=1.6,
+                   help="texture-motion energy that counts as slip (grayscale levels/frame)")
     p.add_argument("--out", default=None)
     p.set_defaults(func=cmd_eval_session)
 
