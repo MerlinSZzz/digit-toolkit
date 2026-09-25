@@ -135,15 +135,15 @@ Run `make help` for the same list. Every command is a thin wrapper over
 | `make synth` | build a synthetic feature dataset (`datasets/synthetic.npz`) |
 | `make train DATASET=datasets/synthetic.npz MODEL=models/c.pkl` | train + evaluate kNN/SVM/logreg |
 | `make collect LABELS="screw bolt"` | interactively collect labelled **real** samples (you press the object, Enter, then N frames are saved) |
-| `make press-test` | guided **real-press protocol**: untouched → one finger at 6 places → slide → small object; writes a labelled session (`labels.csv`, `protocol.json`) |
-| `make eval-session SESSION=sessions/press_...` | **real** TPR / FPR / localisation error / slip from that session, one command |
+| `make press-test` | guided **real-press protocol**: untouched → one finger at 6 places → slide → small object; writes a labelled session (`labels.csv`, `protocol.json`); the stored reference is the median of its own untouched frames |
+| `make eval-session SESSION=sessions/press_...` | **real** TPR / FPR / localisation error / slip from that session; rebuilds the reference from the session's untouched phase (`REFERENCE=` overrides) |
 | `make predict MODEL=models/c.pkl` | live prediction with a trained model |
 
 ### Development
 
 | command | what it does |
 | --- | --- |
-| `make test` | 39 sensor-free pytest tests (adds capture safety + roll fix) |
+| `make test` | 42 sensor-free pytest tests (adds capture safety + roll fix + session reference) |
 | `make selftest` | sensor-free end-to-end smoke test of processing/recognition/recording |
 
 ---
@@ -158,7 +158,7 @@ sessions/<name>/                  one folder per recording:
     frames.csv                    index, timestamp_ns, filename  (per-frame timestamps)
     meta.json                     serial, node, mode, LED, start/end, count
     video.avi                     optional MJPEG preview
-    reference.png                 optional reference captured with the session
+    reference.png                 session reference (untouched median for press-test)
 datasets/                         feature datasets (.npz)
 models/                           trained classifiers (.pkl)
 .logs/                            check/benchmark/eval JSON and headless renders
@@ -235,7 +235,11 @@ Cable tension or a small shift of the sensor on the table deforms the gel
 slightly, and the difference against an old reference lights up across the
 whole gel. Secure the cable, avoid pulling it, and re-take the reference
 (`make reference` or the `r` key) after any move. A localised, high-contrast
-blob is contact; a broad, low-contrast change is not.
+blob is contact; a broad, low-contrast change is not. `make eval-session` no
+longer trusts a stale session `reference.png`: it rebuilds the reference as the
+median of the session's own untouched frames (the 2026-09-25 session's stored
+`reference.png` differed from its untouched phase in 99.97 % of pixels and made
+all 251 untouched frames false positives).
 
 **Wrong node / "opened but no frames".**
 Use `make list` and the stable path

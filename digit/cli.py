@@ -21,6 +21,7 @@ from . import flow as flow_mod
 from . import processing as P
 from . import recognition as R
 from . import recording as rec
+from . import session_eval
 from . import synth
 from . import viz
 from .capture import CameraError, DigitCamera, CaptureThread
@@ -697,6 +698,7 @@ def cmd_press_test(args) -> int:
         labels_w.writerow(["index", "phase", "label", "cell"])
 
         state = {"index": 0}
+        untouched_frames: List[np.ndarray] = []
 
         def record_phase(phase, label, seconds, cell="", instruction=""):
             _log(f"\n[{phase}] {instruction}")
@@ -708,6 +710,8 @@ def cmd_press_test(args) -> int:
             while time.time() - t0 < float(seconds):
                 frame = camera.read()
                 writer.add(frame)
+                if label == "none":
+                    untouched_frames.append(frame)
                 labels_w.writerow([state["index"], phase, label, cell])
                 state["index"] += 1
             protocol.append(
@@ -724,6 +728,13 @@ def cmd_press_test(args) -> int:
             _log(f"    recorded {state['index'] - start} frames (index {start}..{state['index'] - 1})")
 
         record_phase("untouched", "none", args.untouched_seconds, instruction="leave the gel untouched")
+        if untouched_frames and not args.reference:
+            picks = session_eval.evenly_spaced(list(range(len(untouched_frames))), 60)
+            writer.reference = session_eval.reference_from_frames([untouched_frames[i] for i in picks])
+            _log(
+                f"    session reference rebuilt from {len(picks)} of {len(untouched_frames)} "
+                "untouched frames (median); pass REFERENCE=... to keep an explicit one"
+            )
         for name, _ in PRESS_CELLS:
             record_phase(
                 f"press-{name}",
@@ -785,25 +796,28 @@ def cmd_eval_session(args) -> int:
         _log(f"could not read session {session}: {exc}")
         return 1
 
-    reference = load_reference(args.reference) if args.reference else None
+    labels = session_eval.load_labels(session)
+
+    reference_source = ""
+    if args.reference:
+        reference = load_reference(args.reference)
+        reference_source = f"file:{args.reference}"
+    else:
+        # The session's own untouched phase is the honest reference.  A stale
+        # reference.png (captured before the camera settled, or copied from
+        # another run) makes every frame look like contact.
+        reference = session_eval.reference_from_untouched(session, labels)
+        if reference is not None:
+            n_untouched = len(session_eval.untouched_indices(labels))
+            reference_source = f"session untouched median ({n_untouched} frames)"
     if reference is None:
         ref_path = os.path.join(session, "reference.png")
         if os.path.isfile(ref_path):
             reference = cv2.imread(ref_path)
+            reference_source = "session reference.png (no untouched frames)"
     if reference is None:
         _log("no reference in the session (and none given with --reference)")
         return 1
-
-    labels: Dict[int, Tuple[str, str, str]] = {}
-    labels_path = os.path.join(session, "labels.csv")
-    if os.path.isfile(labels_path):
-        with open(labels_path, newline="", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                labels[int(row["index"])] = (
-                    row.get("label", "unlabeled"),
-                    row.get("cell", ""),
-                    row.get("phase", ""),
-                )
 
     detector = R.TouchDetector(
         reference, threshold=args.threshold, min_area=args.min_area, min_peak=args.min_peak
@@ -816,6 +830,9 @@ def cmd_eval_session(args) -> int:
     per_label: Dict[str, Dict[str, object]] = {}
     loc_errors: List[float] = []
     loc_errors_px: List[float] = []
+    cell_errors: Dict[str, List[float]] = {}
+    cell_frames: Dict[str, int] = {}
+    cell_touch: Dict[str, int] = {}
     slip_events = 0
     slip_frames = 0
     n_eval = 0
@@ -836,14 +853,19 @@ def cmd_eval_session(args) -> int:
             bucket["areas"].append(result.area_px)  # type: ignore[union-attr]
             if cell:
                 bucket["cells"][cell] = int(bucket["cells"].get(cell, 0)) + 1  # type: ignore[union-attr]
+                cell_touch[cell] = cell_touch.get(cell, 0) + 1
 
         if label == "press" and result.touch and result.normalized_centroid is not None:
             cx, cy = cell_centers.get(cell, (width / 2, height / 2))
             ex = result.normalized_centroid[0] * width - cx
             ey = result.normalized_centroid[1] * height - cy
-            loc_errors_px.append(float(np.hypot(ex, ey)))
+            err = float(np.hypot(ex, ey))
+            loc_errors_px.append(err)
+            cell_errors.setdefault(cell, []).append(err)
             loc_errors.append(float(np.hypot(result.normalized_centroid[0] - cx / width,
                                               result.normalized_centroid[1] - cy / height)))
+        if label == "press":
+            cell_frames[cell] = cell_frames.get(cell, 0) + 1
 
         if args.slip and (label == "slide" or prev_label == "slide"):
             gray = P.to_gray(frame)
@@ -883,12 +905,26 @@ def cmd_eval_session(args) -> int:
     press = summary.get("press", {})
     object_ = summary.get("object", {})
     tpr = float(press.get("touch_ratio", 0.0)) if press else None
+    per_cell: Dict[str, Dict[str, object]] = {}
+    for name in cell_frames:
+        errs = cell_errors.get(name, [])
+        touched = cell_touch.get(name, 0)
+        per_cell[name] = {
+            "frames": cell_frames[name],
+            "touch_frames": touched,
+            "touch_ratio": round(touched / cell_frames[name], 4) if cell_frames[name] else 0.0,
+            "loc_n": len(errs),
+            "loc_mean_px": round(float(np.mean(errs)), 2) if errs else None,
+            "loc_p90_px": round(float(np.percentile(errs, 90)), 2) if errs else None,
+        }
     payload: Dict[str, object] = {
         "session": os.path.abspath(session),
         "n_frames": meta.n_frames,
         "n_evaluated": n_eval,
+        "reference_source": reference_source,
         "threshold": args.threshold,
         "min_area": args.min_area,
+        "min_peak": args.min_peak,
         "per_label": summary,
         "touch": {
             "tpr_press": tpr,
@@ -900,6 +936,7 @@ def cmd_eval_session(args) -> int:
             "mean_px": round(float(np.mean(loc_errors_px)), 2) if loc_errors_px else None,
             "p90_px": round(float(np.percentile(loc_errors_px, 90)), 2) if loc_errors_px else None,
             "mean_norm": round(float(np.mean(loc_errors)), 4) if loc_errors else None,
+            "per_cell": per_cell,
         },
         "slip": {"events": slip_events, "frames": slip_frames} if args.slip else None,
     }
@@ -1253,7 +1290,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frames", type=int, default=None)
     p.add_argument("--threshold", type=float, default=10.0)
     p.add_argument("--min-area", type=int, default=40)
-    p.add_argument("--min-peak", type=float, default=0.0, help="reject blobs weaker than this peak change")
+    p.add_argument("--min-peak", type=float, default=25.0, help="reject blobs weaker than this peak change")
     p.add_argument("--json", action="store_true")
     p.add_argument("--interval", type=float, default=0.5)
     p.add_argument("--fake", action="store_true", help="synthetic source, no sensor")
@@ -1312,7 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reference", default=None)
     p.add_argument("--threshold", type=float, default=10.0)
     p.add_argument("--min-area", type=int, default=40)
-    p.add_argument("--min-peak", type=float, default=0.0, help="reject blobs weaker than this peak change")
+    p.add_argument("--min-peak", type=float, default=25.0, help="reject blobs weaker than this peak change")
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--stop", type=int, default=None)
     p.add_argument("--slip", dest="slip", action="store_true", default=True)
