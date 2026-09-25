@@ -1,11 +1,13 @@
 # DIGIT tactile sensor toolkit
 
-> **中文摘要**：这是给新来的 visitor 使用的 DIGIT 触觉传感器工具包。它把「读取、LED 控制、分辨率/帧率、
-> 实时可视化、接触检测与定位、相对深度/法线、光流与滑动检测、录制回放、一个可训练的分类示例、测试与文档」
-> 都收在一条 `make <命令>` 和 `python -m digit <命令>` 之下。五步上手：`make setup` → 插上传感器 →
-> `make check` → `make view` → `make record`。所有实时量（面积、力代理、深度）都是**未经标定的相对量**，
-> 不是毫米或牛顿。用法、每个功能的参数与局限见本文件与 [`FEATURES.md`](FEATURES.md)；开源项目与许可见
-> [`CREDITS.md`](CREDITS.md)。
+> **In short:** this toolkit puts everything you need for the DIGIT tactile sensor behind one
+> `make <command>` (or `python -m digit <command>`): reading frames, LED control, resolution and
+> frame rate, live views, contact detection and localisation, relative depth and normals, texture
+> flow and slip detection, recording and playback, a small trainable classifier, tests and docs.
+> Five steps to start: `make setup` → plug in the sensor → `make check` → `make view` → `make record`.
+> Every live quantity (area, force proxy, depth) is **relative and uncalibrated**, not millimetres or
+> newtons. Each feature's parameters and limits are in [`FEATURES.md`](FEATURES.md); the open-source
+> projects used and their licences are in [`CREDITS.md`](CREDITS.md).
 
 A small, beginner-friendly toolkit for the **Facebook/Meta DIGIT** optical
 tactile sensor (USB `2833:0209`), modelled on the lab's GelSight toolkit
