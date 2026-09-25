@@ -89,7 +89,7 @@ USB drop, publishing the newest frame to `wait_new(last_seq)` with `fps`,
 ## 2b. Orientation — `digit.orientation`
 
 **Computes.** The transform from the stored camera frame to the sensor as the
-operator holds it.  The owner's answer (2026-09-25) is the ground truth: the
+operator holds it.  Jamie's answer (2026-09-25) is the ground truth: the
 **rounded end is "up"** (an arrow on the back points that way) and the
 **square cable end is down**.  Pressing the guided protocol at the operator's
 top-left and finding the contact at the *upper right* of the official portrait
@@ -167,7 +167,7 @@ percentile **0.47 px**; 3x3 cell accuracy **1.00** (see §8 for the exact test).
 
 **Measured (real, untouched):** the 2026-09-24 recording
 (`.logs/real_press_20260924`, 1567 frames / 100 s, 640x480@30 requested) is
-**entirely untouched** — the owner confirmed he did not press. Every frame is a
+**entirely untouched** — Jamie confirmed he did not press. Every frame is a
 false positive by definition, so it measures the real false-positive rate.
 Detector defaults: `threshold=10`, `min_area=40`, reference = the per-pixel
 median of frames 100–160 (frame 0 is an auto-exposure/LED warm-up frame and must
@@ -200,7 +200,7 @@ roll bands 215–432 / 1331–1566 → 0.601 / 0.394; the large-roll band 460–
   (8x8 block means within ±1 level), per-channel means move by < 0.5, and the
   grayscale diff std is 1.15 — identical to a clean frame (1.15). It is the
   capture roll, **not** a press, **not** LED/auto-exposure (brightness is flat),
-  and we cannot attribute it to the cable-strain deformation the owner
+  and we cannot attribute it to the cable-strain deformation Jamie
   suspected. An adaptive reference does not help (0.535 → 0.534) precisely
   because there is no slow drift to track after the roll is fixed.
 - For comparison, a synthetic contact on the real gel has TPR 1.00 / FPR 0.00
@@ -209,7 +209,7 @@ roll bands 215–432 / 1331–1566 → 0.601 / 0.394; the large-roll band 460–
 
 ### Measured (real, 2026-09-25 press session)
 
-Source: `rebecca/digit/sessions/press_20260925_092909/` (owner's `make press-test`,
+Source: `sessions/press_20260925_092909/` (Jamie's `make press-test`,
 904 frames 480x640@30, 251 untouched + 6 press cells + 252 slide + 3x38
 object).  The first `make eval-session` run reported `touch_ratio 1.0` for
 **every** label including the 251 untouched frames (FPR 1.0), mean "contact"

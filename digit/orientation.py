@@ -7,7 +7,7 @@ The raw UVC buffer is landscape (640x480).  The official DIGIT convention
 
 which is the "official" stored view.
 
-The owner holds the sensor with the **rounded end up** (an arrow on the back
+Hold the sensor with the **rounded end up** (an arrow on the back
 points that way) and the **square cable end down**.  Comparing the six
 guided-press cells of the 2026-09-25 session against that physical layout shows
 that the official portrait frame is **left-right mirrored** relative to the

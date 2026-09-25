@@ -46,7 +46,7 @@ a dark housing border. The toolkit auto-detects the usable gel area
 
 ### Which end is up
 
-The owner holds the sensor with the **rounded end up** (an arrow on the back
+Hold the sensor with the **rounded end up** (an arrow on the back
 points that way) and the **square cable end down**. The raw buffer is
 landscape; the camera's *official* portrait view (`transpose` + vertical flip)
 is **left-right mirrored** relative to the operator, while up is already up.
